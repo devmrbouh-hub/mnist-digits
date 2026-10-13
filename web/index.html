@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Веса сети MNIST</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #141414;
+      --card: #1e1e1e;
+      --text: #f2f2f2;
+      --muted: #a8a8a8;
+      --line: #333;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 28px 24px 64px;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.45 "Segoe UI", sans-serif;
+    }
+    h1 { font-size: 28px; margin: 0 0 8px; }
+    h2 { font-size: 20px; margin: 32px 0 8px; }
+    p { margin: 0 0 12px; }
+    .status {
+      padding: 12px 14px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      max-width: 920px;
+    }
+    .note { color: var(--muted); max-width: 920px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, 140px);
+      gap: 16px;
+      margin-top: 12px;
+    }
+    .neuron, .panel {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px;
+    }
+    .neuron canvas { display: block; width: 112px; height: 112px; background: #000; }
+    .caption { margin-top: 6px; color: var(--muted); font-size: 13px; white-space: pre-line; }
+    .panel { display: inline-block; margin: 8px 16px 0 0; vertical-align: top; }
+    .panel canvas { display: block; background: #111; }
+    .legend { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Веса сети для цифр</h1>
+  <p class="status" id="status">Загрузка…</p>
+
+  <h2>Первый скрытый слой</h2>
+  <p class="note">
+    16 нейронов. У каждого 784 веса, по одному на пиксель. На экране они снова
+    сложены в квадрат 28×28, как цифра в ролике. Белое — больший вес этого
+    нейрона, чёрное — меньший. Шкала у каждой картинки своя, поэтому подпись
+    показывает настоящие минимум и максимум: иначе растяжка сошла бы за сами числа.
+  </p>
+  <div class="grid" id="layer-pixels"></div>
+
+  <h2>Второй скрытый слой</h2>
+  <p class="note">
+    Матрица 16×16. Строка — нейрон этого слоя, столбец — нейрон предыдущего.
+    Красная клетка тянет сумму вверх, синяя вниз, серая около нуля.
+    Одна шкала на всю матрицу, чтобы клетки можно было сравнивать.
+  </p>
+  <div id="layer-hidden2"></div>
+
+  <h2>Выход</h2>
+  <p class="note">
+    Матрица 10×16. Строка — цифра 0–9, столбец — нейрон второго скрытого слоя.
+    Это ещё не вероятности, а сырые оценки. Цифра ответа — строка с самой
+    большой оценкой после прохода картинки, её здесь не считаем.
+  </p>
+  <div id="layer-output"></div>
+
+  <h2>Смещения</h2>
+  <p class="note">
+    Смещение прибавляется к взвешенной сумме до сигмоиды (на выходе — до оценки).
+    Ноль отмечен линией посередине. Красный столбик вверх — положительное
+    смещение, синий вниз — отрицательное. Высота внутри одного слоя
+    относительно самого большого смещения этого слоя.
+  </p>
+  <div id="biases"></div>
+
+  <script>
+    // Два раза в секунду. Снимок на диске обновляется реже, лишние ответы
+    // сервер отдаёт из памяти, если файл не менялся.
+    const POLL_MS = 500;
+
+    const statusNode = document.getElementById("status");
+    const pixelsNode = document.getElementById("layer-pixels");
+    const hidden2Node = document.getElementById("layer-hidden2");
+    const outputNode = document.getElementById("layer-output");
+    const biasesNode = document.getElementById("biases");
+
+    function formatNumber(value) {
+      return Number(value).toFixed(3);
+    }
+
+    function formatAccuracy(value) {
+      if (value === null || value === undefined) {
+        return "ещё не считалась";
+      }
+      return (value * 100).toFixed(1).replace(".", ",") + " %";
+    }
+
+    function statusText(data) {
+      if (!data.trained) {
+        return "Обучения ещё не было. На картинках случайные начальные веса, поэтому первый слой похож на шум.";
+      }
+      return (
+        "Эпоха " + data.epoch +
+        ", батч " + data.batch +
+        ". Доля верных ответов на проверочных 10 000: " +
+        formatAccuracy(data.test_accuracy) +
+        "."
+      );
+    }
+
+    // Серый 0…255 по своим min/max одного нейрона.
+    function gray(value, min, max) {
+      if (max === min) {
+        return 128;
+      }
+      const ratio = (value - min) / (max - min);
+      return Math.round(Math.min(1, Math.max(0, ratio)) * 255);
+    }
+
+    function drawPixels(canvas, weights) {
+      let min = Infinity;
+      let max = -Infinity;
+      for (const value of weights) {
+        if (value < min) min = value;
+        if (value > max) max = value;
+      }
+      const small = document.createElement("canvas");
+      small.width = 28;
+      small.height = 28;
+      const image = small.getContext("2d").createImageData(28, 28);
+      for (let i = 0; i < 784; i++) {
+        const shade = gray(weights[i], min, max);
+        const offset = i * 4;
+        image.data[offset] = shade;
+        image.data[offset + 1] = shade;
+        image.data[offset + 2] = shade;
+        image.data[offset + 3] = 255;
+      }
+      small.getContext("2d").putImageData(image, 0, 0);
+      // Увеличиваем без сглаживания, чтобы один вес оставался одним квадратом.
+      const view = canvas.getContext("2d");
+      view.imageSmoothingEnabled = false;
+      view.clearRect(0, 0, canvas.width, canvas.height);
+      view.drawImage(small, 0, 0, canvas.width, canvas.height);
+      return { min: min, max: max };
+    }
+
+    function limitOf(matrix) {
+      let limit = 0;
+      for (const row of matrix) {
+        for (const value of row) {
+          const abs = Math.abs(value);
+          if (abs > limit) limit = abs;
+        }
+      }
+      return limit;
+    }
+
+    // t от -1 до 1: синий, серый в нуле, красный.
+    function diverging(value, limit) {
+      const t = limit === 0 ? 0 : Math.max(-1, Math.min(1, value / limit));
+      if (t >= 0) {
+        return [
+          Math.round(42 + 190 * t),
+          Math.round(42 * (1 - t)),
+          Math.round(42 * (1 - t)),
+        ];
+      }
+      const amount = -t;
+      return [
+        Math.round(42 * (1 - amount)),
+        Math.round(70 * (1 - amount)),
+        Math.round(42 + 190 * amount),
+      ];
+    }
+
+    function drawMatrix(canvas, matrix, rowLabels) {
+      const rows = matrix.length;
+      const cols = matrix[0].length;
+      const cell = 16;
+      const labelWidth = rowLabels ? 22 : 0;
+      canvas.width = labelWidth + cols * cell;
+      canvas.height = rows * cell;
+      const view = canvas.getContext("2d");
+      view.clearRect(0, 0, canvas.width, canvas.height);
+      view.font = "11px Segoe UI, sans-serif";
+      view.fillStyle = "#bbbbbb";
+      view.textBaseline = "middle";
+      const limit = limitOf(matrix);
+      for (let row = 0; row < rows; row++) {
+        if (rowLabels) {
+          view.fillStyle = "#bbbbbb";
+          view.fillText(String(rowLabels[row]), 0, row * cell + cell / 2);
+        }
+        for (let col = 0; col < cols; col++) {
+          const [r, g, b] = diverging(matrix[row][col], limit);
+          view.fillStyle = "rgb(" + r + "," + g + "," + b + ")";
+          view.fillRect(labelWidth + col * cell, row * cell, cell - 1, cell - 1);
+        }
+      }
+      return limit;
+    }
+
+    function drawBiases(canvas, biases) {
+      const width = Math.max(220, biases.length * 18);
+      const height = 72;
+      canvas.width = width;
+      canvas.height = height;
+      const view = canvas.getContext("2d");
+      view.clearRect(0, 0, width, height);
+      let maxAbs = 1e-8;
+      for (const value of biases) {
+        maxAbs = Math.max(maxAbs, Math.abs(value));
+      }
+      const mid = height / 2;
+      const barWidth = width / biases.length;
+      for (let i = 0; i < biases.length; i++) {
+        const value = biases[i];
+        const barHeight = (value / maxAbs) * (mid - 4);
+        view.fillStyle = value >= 0 ? "#c4514a" : "#4a78c4";
+        view.fillRect(
+          i * barWidth + 2,
+          mid - Math.max(barHeight, 0),
+          barWidth - 4,
+          Math.abs(barHeight)
+        );
+      }
+      view.strokeStyle = "#888888";
+      view.beginPath();
+      view.moveTo(0, mid);
+      view.lineTo(width, mid);
+      view.stroke();
+    }
+
+    function ensurePixelCards(count) {
+      while (pixelsNode.children.length < count) {
+        const index = pixelsNode.children.length;
+        const card = document.createElement("div");
+        card.className = "neuron";
+        const canvas = document.createElement("canvas");
+        canvas.width = 112;
+        canvas.height = 112;
+        const caption = document.createElement("div");
+        caption.className = "caption";
+        card.append(canvas, caption);
+        pixelsNode.append(card);
+        card.dataset.index = String(index);
+      }
+    }
+
+    function panel(host, title) {
+      let node = host.querySelector(".panel");
+      if (!node) {
+        node = document.createElement("div");
+        node.className = "panel";
+        node.innerHTML = "<canvas></canvas><div class='legend'></div>";
+        host.append(node);
+      }
+      return node;
+    }
+
+    function paint(data) {
+      statusNode.textContent = statusText(data);
+      const [first, second, output] = data.layers;
+
+      ensurePixelCards(first.weight.length);
+      first.weight.forEach(function (row, index) {
+        const card = pixelsNode.children[index];
+        const range = drawPixels(card.querySelector("canvas"), row);
+        card.querySelector(".caption").textContent =
+          "нейрон " + index +
+          "\nmin " + formatNumber(range.min) +
+          "  max " + formatNumber(range.max);
+      });
+
+      const hiddenPanel = panel(hidden2Node);
+      const hiddenLimit = drawMatrix(hiddenPanel.querySelector("canvas"), second.weight, null);
+      hiddenPanel.querySelector(".legend").textContent =
+        "от " + formatNumber(-hiddenLimit) + " до " + formatNumber(hiddenLimit);
+
+      const outputPanel = panel(outputNode);
+      const digitLabels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+      const outputLimit = drawMatrix(outputPanel.querySelector("canvas"), output.weight, digitLabels);
+      outputPanel.querySelector(".legend").textContent =
+        "строки 0–9, от " + formatNumber(-outputLimit) + " до " + formatNumber(outputLimit);
+
+      biasesNode.innerHTML = "";
+      const biasLayers = [
+        ["Первый скрытый слой", first.bias],
+        ["Второй скрытый слой", second.bias],
+        ["Выход", output.bias],
+      ];
+      biasLayers.forEach(function (entry) {
+        const block = document.createElement("div");
+        block.className = "panel";
+        const title = document.createElement("div");
+        title.className = "caption";
+        title.textContent = entry[0];
+        const canvas = document.createElement("canvas");
+        const legend = document.createElement("div");
+        legend.className = "legend";
+        block.append(title, canvas, legend);
+        biasesNode.append(block);
+        drawBiases(canvas, entry[1]);
+        let min = Infinity;
+        let max = -Infinity;
+        entry[1].forEach(function (value) {
+          if (value < min) min = value;
+          if (value > max) max = value;
+        });
+        legend.textContent = "min " + formatNumber(min) + "  max " + formatNumber(max);
+      });
+    }
+
+    async function poll() {
+      try {
+        const response = await fetch("/api/weights", { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error("ответ " + response.status);
+        }
+        paint(await response.json());
+      } catch (error) {
+        statusNode.textContent = "Не удалось прочитать веса: " + error.message;
+      }
+    }
+
+    poll();
+    setInterval(poll, POLL_MS);
+  </script>
+</body>
+</html>

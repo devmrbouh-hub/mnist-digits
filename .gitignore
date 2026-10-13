@@ -1,0 +1,36 @@
+# Секреты
+.env
+.env.local
+.env.*.local
+*.pem
+credentials.json
+!.env.example
+
+# Python
+__pycache__/
+.venv/
+venv/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Node
+node_modules/
+dist/
+build/
+.next/
+
+# Данные и артефакты
+*.log
+*.tmp
+.cache/
+data/
+output/
+*.pkl
+*.h5
+*.onnx
+
+# IDE / OS
+.idea/
+Thumbs.db
+.DS_Store

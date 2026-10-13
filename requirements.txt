@@ -1,0 +1,6 @@
+# Зависимости эксперимента.
+# torch и torchvision ставить CPU-сборкой, иначе pip может принести
+# многогигабайтный вариант с CUDA. Команды есть в README.
+torch
+torchvision
+matplotlib
