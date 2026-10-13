@@ -8,11 +8,13 @@
 """
 
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import torch
 
-from model import CHECKPOINT_PATH, ROOT, SEED, DigitNet
+from model import CHECKPOINT_PATH, HISTORY_DIR, ROOT, SEED, DigitNet
 
 HOST = "127.0.0.1"
 PORT = 8765
@@ -24,9 +26,11 @@ INDEX_PATH = ROOT / "web" / "index.html"
 torch.manual_seed(SEED)
 INITIAL_MODEL = DigitNet()
 
-# Последний удачно прочитанный снимок, если файл на миг занят заменой.
-_cached_mtime = None
-_cached_payload = None
+# Отдельный кэш на каждый файл. Общий кэш отдал бы веса другого кадра.
+# Значение: (mtime, payload). Если файл поймали в момент замены, остаётся прошлый.
+_cache = {}
+# Имя кадра — ровно пять цифр, как 00010.pt. Иначе это путь мимо каталога истории.
+FRAME_NAME = re.compile(r"^\d{5}$")
 
 
 def model_payload(model, trained, epoch, batch, test_accuracy):
@@ -56,6 +60,7 @@ def model_payload(model, trained, epoch, batch, test_accuracy):
         )
     return {
         "trained": trained,
+        "step": None,
         "epoch": epoch,
         "batch": batch,
         "test_accuracy": test_accuracy,
@@ -63,21 +68,39 @@ def model_payload(model, trained, epoch, batch, test_accuracy):
     }
 
 
-def current_payload():
-    """Прочитать снимок с диска или отдать начальные веса."""
-    global _cached_mtime, _cached_payload
+def history_names():
+    """Имена кадров без загрузки весов. Пустой список, если обучения ещё не было."""
+    if not HISTORY_DIR.is_dir():
+        return []
+    names = []
+    for path in HISTORY_DIR.glob("*.pt"):
+        if FRAME_NAME.fullmatch(path.stem):
+            names.append(path.stem)
+    names.sort()
+    return names
 
-    if not CHECKPOINT_PATH.exists():
+
+def payload_from_file(path, step):
+    """Прочитать один кадр. step — номер из имени файла, не из чужого кэша."""
+    key = str(path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        cached = _cache.get(key)
+        if cached is not None:
+            return cached[1]
         return model_payload(INITIAL_MODEL, False, None, None, None)
 
-    mtime = CHECKPOINT_PATH.stat().st_mtime
-    if _cached_payload is not None and mtime == _cached_mtime:
-        return _cached_payload
+    cached = _cache.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
 
     try:
         # Файл пишем мы сами из train.py. weights_only=False, потому что
         # в словаре рядом с тензорами лежат номер эпохи и доля верных ответов.
-        blob = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
+        # Закрыть файл сразу: иначе Windows не даёт train.py подменить снимок.
+        with path.open("rb") as handle:
+            blob = torch.load(handle, map_location="cpu", weights_only=False)
         model = DigitNet()
         model.load_state_dict(blob["state_dict"])
         payload = model_payload(
@@ -87,26 +110,57 @@ def current_payload():
             int(blob["batch"]),
             blob["test_accuracy"],
         )
+        # Номер шага берём из имени файла: в старом снимке поля step могло не быть.
+        payload["step"] = step if step is not None else blob.get("step")
     except (OSError, RuntimeError, KeyError, ValueError):
-        # Снимок могли поймать ровно в момент замены. Отдаём прошлый удачный.
-        if _cached_payload is not None:
-            return _cached_payload
+        if cached is not None:
+            return cached[1]
         return model_payload(INITIAL_MODEL, False, None, None, None)
 
-    _cached_mtime = mtime
-    _cached_payload = payload
+    _cache[key] = (mtime, payload)
     return payload
+
+
+def current_payload():
+    """Последний снимок или начальные веса, если файла ещё нет."""
+    if not CHECKPOINT_PATH.exists():
+        return model_payload(INITIAL_MODEL, False, None, None, None)
+    return payload_from_file(CHECKPOINT_PATH, None)
+
+
+def frame_payload(name):
+    """Один кадр истории. Неверное имя не превращается в путь по диску."""
+    if not FRAME_NAME.fullmatch(name or ""):
+        return None
+    path = HISTORY_DIR / f"{name}.pt"
+    if not path.is_file():
+        return None
+    return payload_from_file(path, int(name))
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        # Query отдельно от пути: иначе ?frame=00010 потеряется до разбора.
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/":
             body = INDEX_PATH.read_bytes()
             self._send(200, "text/html; charset=utf-8", body)
             return
+        if path == "/api/history":
+            body = json.dumps(history_names()).encode("utf-8")
+            self._send(200, "application/json; charset=utf-8", body)
+            return
         if path == "/api/weights":
-            body = json.dumps(current_payload(), ensure_ascii=False).encode("utf-8")
+            frame = parse_qs(parsed.query).get("frame", [None])[0]
+            if frame is None:
+                payload = current_payload()
+            else:
+                payload = frame_payload(frame)
+                if payload is None:
+                    self._send(404, "text/plain; charset=utf-8", "нет такого кадра".encode("utf-8"))
+                    return
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._send(200, "application/json; charset=utf-8", body)
             return
         if path == "/favicon.ico":
@@ -126,7 +180,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         # Опрос два раза в секунду забил бы консоль. Обычные запросы оставляем.
-        if self.path.split("?", 1)[0] == "/api/weights":
+        if urlparse(self.path).path in ("/api/weights", "/api/history"):
             return
         super().log_message(fmt, *args)
 

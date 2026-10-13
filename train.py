@@ -11,6 +11,8 @@
 """
 
 import os
+import shutil
+import time
 
 import torch
 from torch import nn
@@ -19,34 +21,60 @@ from torchvision import datasets, transforms
 
 from model import (
     BATCH_SIZE,
-    CHECKPOINT_EVERY_BATCHES,
     CHECKPOINT_PATH,
     DATA_DIR,
     EPOCHS,
+    HISTORY_DIR,
+    HISTORY_EVERY_STEPS,
     LEARNING_RATE,
-    OUTPUT_DIR,
     SEED,
     DigitNet,
 )
 
 
-def save_checkpoint(model, epoch, batch, test_accuracy):
-    """Атомарно записать снимок, который читает страница весов.
+def write_atomic(path, payload):
+    """Записать файл целиком: временный сосед, затем подмена.
 
-    Сначала пишем временный файл, потом подменяем им постоянный.
-    Читатель либо видит старый целый снимок, либо новый целый,
-    но не обрывки посередине записи.
+    Читатель видит либо старый целый кадр, либо новый целый.
+    Обрывка посередине записи не бывает.
     """
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".pt.tmp")
+    torch.save(payload, temporary)
+    # На Windows страница может держать файл открытым в момент чтения.
+    # Несколько попыток, иначе обучение падает на середине эпохи.
+    for attempt in range(30):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    os.replace(temporary, path)
+
+
+def save_frame(model, step, epoch, batch, test_accuracy):
+    """Сохранить один кадр истории и сделать его текущим снимком.
+
+    Имя файла — пятизначный номер уже сделанного optimizer.step().
+    checkpoint.pt дублирует этот же кадр, чтобы страница без ползунка
+    по-прежнему показывала последний шаг.
+    """
     payload = {
         "state_dict": model.state_dict(),
+        "step": step,
         "epoch": epoch,
         "batch": batch,
         "test_accuracy": test_accuracy,
     }
-    temporary = CHECKPOINT_PATH.with_suffix(".pt.tmp")
-    torch.save(payload, temporary)
-    os.replace(temporary, CHECKPOINT_PATH)
+    write_atomic(HISTORY_DIR / f"{step:05d}.pt", payload)
+    write_atomic(CHECKPOINT_PATH, payload)
+
+
+def clear_history():
+    """Убрать кадры прошлого прогона, чтобы новый seed не смешался со старым."""
+    if HISTORY_DIR.exists():
+        shutil.rmtree(HISTORY_DIR)
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def evaluate(model, loader):
@@ -95,6 +123,9 @@ def main():
 
     # None, пока первая эпоха не дошла до экзамена.
     test_accuracy = None
+    # Сколько раз уже вызван optimizer.step(). Это номер кадра, не пачка внутри эпохи.
+    step = 0
+    clear_history()
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -106,9 +137,10 @@ def main():
             # Градиент только по этому обучающему батчу.
             loss.backward()
             optimizer.step()
+            step += 1
 
-            if batch_index % CHECKPOINT_EVERY_BATCHES == 0:
-                save_checkpoint(model, epoch, batch_index, test_accuracy)
+            if step % HISTORY_EVERY_STEPS == 0:
+                save_frame(model, step, epoch, batch_index, test_accuracy)
 
         # Экзамен после прохода по всем 60 000. В обновление весов не входит.
         test_accuracy = evaluate(model, test_loader)
@@ -116,7 +148,8 @@ def main():
             f"Эпоха {epoch}: верных ответов на проверочных 10 000 — "
             f"{test_accuracy:.1%}"
         )
-        save_checkpoint(model, epoch, last_batch, test_accuracy)
+        # Конец эпохи пишем даже если шаг уже сохранился: в кадре будет свежая доля.
+        save_frame(model, step, epoch, last_batch, test_accuracy)
 
 
 if __name__ == "__main__":

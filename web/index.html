@@ -49,34 +49,65 @@
     .panel { display: inline-block; margin: 8px 16px 0 0; vertical-align: top; }
     .panel canvas { display: block; background: #111; }
     .legend { color: var(--muted); font-size: 13px; margin-top: 6px; }
+    .scrubber {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--bg);
+      padding: 8px 0 12px;
+    }
+    .scrubber[hidden] { display: none; }
+    .panel.diff[hidden] { display: none; }
+    .scrubber label { display: block; margin-bottom: 6px; }
+    .scrubber input { width: min(920px, 100%); }
+    .numbers { margin-top: 8px; overflow-x: auto; }
+    table.weights {
+      border-collapse: collapse;
+      font: 11px/1.2 Consolas, "Courier New", monospace;
+      background: var(--card);
+    }
+    table.weights td, table.weights th {
+      border: 1px solid var(--line);
+      padding: 2px 4px;
+      text-align: right;
+      color: #ddd;
+      font-weight: normal;
+    }
+    table.weights th { color: var(--muted); text-align: center; }
   </style>
 </head>
 <body>
   <h1>Веса сети для цифр</h1>
+  <div class="scrubber" id="scrubber" hidden>
+    <label id="scrub-label" for="scrub">Кадр истории</label>
+    <input id="scrub" type="range" min="0" max="0" value="0">
+  </div>
   <p class="status" id="status">Загрузка…</p>
 
   <h2>Первый скрытый слой</h2>
-  <p class="note">
+  <p class="note" id="note-pixels">
     16 нейронов. У каждого 784 веса, по одному на пиксель. На экране они снова
-    сложены в квадрат 28×28, как цифра в ролике. Белое — больший вес этого
-    нейрона, чёрное — меньший. Шкала у каждой картинки своя, поэтому подпись
-    показывает настоящие минимум и максимум: иначе растяжка сошла бы за сами числа.
+    сложены в квадрат 28×28, как цифра в ролике. Белое — больший вес, чёрное —
+    меньший. Серая шкала одна на весь слой и взята с последнего кадра: минимум
+    и максимум по всем 16×784 весам. Подпись под картинкой — настоящие минимум
+    и максимум этого нейрона в этом кадре.
   </p>
   <div class="grid" id="layer-pixels"></div>
 
   <h2>Второй скрытый слой</h2>
-  <p class="note">
-    Матрица 16×16. Строка — нейрон этого слоя, столбец — нейрон предыдущего.
-    Красная клетка тянет сумму вверх, синяя вниз, серая около нуля.
-    Одна шкала на всю матрицу, чтобы клетки можно было сравнивать.
+  <p class="note" id="note-hidden2">
+    Цвет слева — сам вес: красная клетка тянет сумму вверх, синяя вниз.
+    Рядом изменение с первого кадра истории. Дальше те же 16×16 чисел,
+    три знака после запятой. Строка — нейрон этого слоя, столбец — нейрон
+    предыдущего.
   </p>
   <div id="layer-hidden2"></div>
 
   <h2>Выход</h2>
-  <p class="note">
-    Матрица 10×16. Строка — цифра 0–9, столбец — нейрон второго скрытого слоя.
-    Это ещё не вероятности, а сырые оценки. Цифра ответа — строка с самой
-    большой оценкой после прохода картинки, её здесь не считаем.
+  <p class="note" id="note-output">
+    Строка — цифра 0–9, столбец — нейрон второго скрытого слоя. Цвет слева —
+    сам вес, рядом изменение с первого кадра, затем само число связи.
+    Это ещё не вероятности, а сырые оценки.
   </p>
   <div id="layer-output"></div>
 
@@ -95,13 +126,17 @@
     const POLL_MS = 500;
 
     const statusNode = document.getElementById("status");
+    const scrubberNode = document.getElementById("scrubber");
+    const scrubNode = document.getElementById("scrub");
+    const scrubLabel = document.getElementById("scrub-label");
     const pixelsNode = document.getElementById("layer-pixels");
     const hidden2Node = document.getElementById("layer-hidden2");
     const outputNode = document.getElementById("layer-output");
     const biasesNode = document.getElementById("biases");
 
     function formatNumber(value) {
-      return Number(value).toFixed(3);
+      // Запятая, как в подписи доли верных: три знака после неё.
+      return Number(value).toFixed(3).replace(".", ",");
     }
 
     function formatAccuracy(value) {
@@ -124,7 +159,7 @@
       );
     }
 
-    // Серый 0…255 по своим min/max одного нейрона.
+    // Серый 0…255. Общая шкала слоя или, если её нет, min/max одного нейрона.
     function gray(value, min, max) {
       if (max === min) {
         return 128;
@@ -133,19 +168,22 @@
       return Math.round(Math.min(1, Math.max(0, ratio)) * 255);
     }
 
-    function drawPixels(canvas, weights) {
+    function drawPixels(canvas, weights, scaleMin, scaleMax) {
+      // min/max строки нужны подписи. В серый они идут, только когда общей шкалы нет.
       let min = Infinity;
       let max = -Infinity;
       for (const value of weights) {
         if (value < min) min = value;
         if (value > max) max = value;
       }
+      const shadeMin = scaleMin == null ? min : scaleMin;
+      const shadeMax = scaleMax == null ? max : scaleMax;
       const small = document.createElement("canvas");
       small.width = 28;
       small.height = 28;
       const image = small.getContext("2d").createImageData(28, 28);
       for (let i = 0; i < 784; i++) {
-        const shade = gray(weights[i], min, max);
+        const shade = gray(weights[i], shadeMin, shadeMax);
         const offset = i * 4;
         image.data[offset] = shade;
         image.data[offset + 1] = shade;
@@ -190,7 +228,7 @@
       ];
     }
 
-    function drawMatrix(canvas, matrix, rowLabels) {
+    function drawMatrix(canvas, matrix, rowLabels, fixedLimit) {
       const rows = matrix.length;
       const cols = matrix[0].length;
       const cell = 16;
@@ -202,7 +240,7 @@
       view.font = "11px Segoe UI, sans-serif";
       view.fillStyle = "#bbbbbb";
       view.textBaseline = "middle";
-      const limit = limitOf(matrix);
+      const limit = fixedLimit == null ? limitOf(matrix) : fixedLimit;
       for (let row = 0; row < rows; row++) {
         if (rowLabels) {
           view.fillStyle = "#bbbbbb";
@@ -264,8 +302,9 @@
       }
     }
 
-    function panel(host, title) {
-      let node = host.querySelector(".panel");
+    function panel(host) {
+      // Разность и таблица чисел тоже с классом panel. Их canvas сюда брать нельзя.
+      let node = host.querySelector(".panel:not(.diff):not(.numbers)");
       if (!node) {
         node = document.createElement("div");
         node.className = "panel";
@@ -275,14 +314,137 @@
       return node;
     }
 
+    function numberTable(host, matrix, rowLabels) {
+      // Таблица рядом с цветом: те же строки и столбцы, в клетке само число.
+      let wrap = host.querySelector(".numbers");
+      if (!wrap) {
+        wrap = document.createElement("div");
+        wrap.className = "numbers panel";
+        host.append(wrap);
+      }
+      const rows = matrix.length;
+      const cols = matrix[0].length;
+      let html = "<table class='weights'>";
+      for (let row = 0; row < rows; row++) {
+        html += "<tr>";
+        if (rowLabels) {
+          html += "<th>" + rowLabels[row] + "</th>";
+        }
+        for (let col = 0; col < cols; col++) {
+          html += "<td>" + formatNumber(matrix[row][col]) + "</td>";
+        }
+        html += "</tr>";
+      }
+      html += "</table>";
+      wrap.innerHTML = html;
+    }
+
+    function diffPanel(host) {
+      let node = host.querySelector(".diff");
+      if (!node) {
+        node = document.createElement("div");
+        node.className = "panel diff";
+        node.innerHTML = "<canvas></canvas><div class='legend'></div>";
+        const numbers = host.querySelector(".numbers");
+        if (numbers) {
+          host.insertBefore(node, numbers);
+        } else {
+          host.append(node);
+        }
+      }
+      node.hidden = false;
+      return node;
+    }
+
+    function hideDiff(host) {
+      const node = host.querySelector(".diff");
+      if (node) {
+        node.hidden = true;
+      }
+    }
+
+    // Новое полотно: вычитать на месте нельзя, таблица ниже читает те же массивы.
+    function subtract(current, baseline) {
+      return current.map(function (row, index) {
+        const baseRow = baseline[index];
+        return row.map(function (value, column) {
+          return value - baseRow[column];
+        });
+      });
+    }
+
+    function rangeOf(matrix) {
+      let min = Infinity;
+      let max = -Infinity;
+      for (const row of matrix) {
+        for (const value of row) {
+          if (value < min) min = value;
+          if (value > max) max = value;
+        }
+      }
+      return { min: min, max: max };
+    }
+
+    function scalesFrom(lastData, anchorData) {
+      const last = lastData.layers;
+      const base = anchorData.layers;
+      const pixels = rangeOf(last[0].weight);
+      return {
+        pixelMin: pixels.min,
+        pixelMax: pixels.max,
+        hiddenLimit: limitOf(last[1].weight),
+        outputLimit: limitOf(last[2].weight),
+        hiddenDiffLimit: limitOf(subtract(last[1].weight, base[1].weight)),
+        outputDiffLimit: limitOf(subtract(last[2].weight, base[2].weight)),
+      };
+    }
+
+    const notePixels = document.getElementById("note-pixels");
+    const noteHidden2 = document.getElementById("note-hidden2");
+    const noteOutput = document.getElementById("note-output");
+    const notesFixed = {
+      pixels: notePixels.textContent,
+      hidden2: noteHidden2.textContent,
+      output: noteOutput.textContent,
+    };
+    const notesOwn = {
+      pixels: "16 нейронов. У каждого 784 веса, по одному на пиксель. На экране они снова сложены в квадрат 28×28, как цифра в ролике. Белое — больший вес этого нейрона, чёрное — меньший. Шкала у каждой картинки своя, поэтому подпись показывает настоящие минимум и максимум: иначе растяжка сошла бы за сами числа.",
+      hidden2: "Слева цвет: красная клетка тянет сумму вверх, синяя вниз. Справа те же 16×16 чисел, три знака после запятой. Строка — нейрон этого слоя, столбец — нейрон предыдущего.",
+      output: "Строка — цифра 0–9, столбец — нейрон второго скрытого слоя. Слева цвет, справа само число связи. Это ещё не вероятности, а сырые оценки.",
+    };
+    let notesAreFixed = true;
+
+    function setNotes(fixed) {
+      if (notesAreFixed === fixed) {
+        return;
+      }
+      notesAreFixed = fixed;
+      const source = fixed ? notesFixed : notesOwn;
+      notePixels.textContent = source.pixels;
+      noteHidden2.textContent = source.hidden2;
+      noteOutput.textContent = source.output;
+    }
+
+    function paintDiff(host, current, baseline, rowLabels, diffLimit) {
+      const node = diffPanel(host);
+      drawMatrix(node.querySelector("canvas"), subtract(current, baseline), rowLabels, diffLimit);
+      node.querySelector(".legend").textContent =
+        "изменение с шага " + anchorName +
+        ", от " + formatNumber(-diffLimit) +
+        " до " + formatNumber(diffLimit);
+    }
+
     function paint(data) {
       statusNode.textContent = statusText(data);
+      setNotes(!!scales);
       const [first, second, output] = data.layers;
 
       ensurePixelCards(first.weight.length);
       first.weight.forEach(function (row, index) {
         const card = pixelsNode.children[index];
-        const range = drawPixels(card.querySelector("canvas"), row);
+        const range = scales
+          ? drawPixels(card.querySelector("canvas"), row, scales.pixelMin, scales.pixelMax)
+          : drawPixels(card.querySelector("canvas"), row);
         card.querySelector(".caption").textContent =
           "нейрон " + index +
           "\nmin " + formatNumber(range.min) +
@@ -290,15 +452,37 @@
       });
 
       const hiddenPanel = panel(hidden2Node);
-      const hiddenLimit = drawMatrix(hiddenPanel.querySelector("canvas"), second.weight, null);
+      const hiddenLimit = drawMatrix(
+        hiddenPanel.querySelector("canvas"),
+        second.weight,
+        null,
+        scales ? scales.hiddenLimit : null
+      );
       hiddenPanel.querySelector(".legend").textContent =
         "от " + formatNumber(-hiddenLimit) + " до " + formatNumber(hiddenLimit);
+      if (scales && anchor) {
+        paintDiff(hidden2Node, second.weight, anchor.layers[1].weight, null, scales.hiddenDiffLimit);
+      } else {
+        hideDiff(hidden2Node);
+      }
+      numberTable(hidden2Node, second.weight, null);
 
       const outputPanel = panel(outputNode);
       const digitLabels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-      const outputLimit = drawMatrix(outputPanel.querySelector("canvas"), output.weight, digitLabels);
+      const outputLimit = drawMatrix(
+        outputPanel.querySelector("canvas"),
+        output.weight,
+        digitLabels,
+        scales ? scales.outputLimit : null
+      );
       outputPanel.querySelector(".legend").textContent =
         "строки 0–9, от " + formatNumber(-outputLimit) + " до " + formatNumber(outputLimit);
+      if (scales && anchor) {
+        paintDiff(outputNode, output.weight, anchor.layers[2].weight, digitLabels, scales.outputDiffLimit);
+      } else {
+        hideDiff(outputNode);
+      }
+      numberTable(outputNode, output.weight, digitLabels);
 
       biasesNode.innerHTML = "";
       const biasLayers = [
@@ -328,17 +512,161 @@
       });
     }
 
+    // Имена кадров и какой из них сейчас на экране.
+    // followLatest: ползунок сам едет вперёд, только если пользователь
+    // не отмотал его назад.
+    let frameNames = [];
+    let shownFrame = null;
+    let shownData = null;
+    let followLatest = true;
+    // Опора разности — первый кадр списка, шкалы — с последнего.
+    let anchor = null;
+    let anchorName = null;
+    let scales = null;
+    let scaleKey = null;
+    // Номер заказа: опоздавший ответ не записывает шкалы поверх более нового.
+    let scaleRequest = 0;
+    // Пока качается пара для этого последнего имени, второй опрос ждёт её, а не качает заново.
+    let scaleFlight = null;
+
+    function scrubCaption(name, data) {
+      const step = data.step == null ? name : String(data.step).padStart(5, "0");
+      return (
+        "Шаг " + step +
+        ", эпоха " + data.epoch +
+        ", пачка " + data.batch +
+        ". Доля верных на 10 000: " +
+        formatAccuracy(data.test_accuracy)
+      );
+    }
+
+    async function loadFrame(name) {
+      const response = await fetch("/api/weights?frame=" + name, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error("ответ " + response.status);
+      }
+      return response.json();
+    }
+
+    function clearScales() {
+      // Сдвигаем номер, чтобы уже летящая пара не вернула шкалы после сброса.
+      scaleRequest += 1;
+      scaleFlight = null;
+      anchor = null;
+      anchorName = null;
+      scales = null;
+      scaleKey = null;
+      hideDiff(hidden2Node);
+      hideDiff(outputNode);
+      setNotes(false);
+    }
+
+    // "applied" — шкалы только что записаны, кадр на экране надо перекрасить.
+    // "same" — последнее имя не менялось. "stale" — этот опрос устарел.
+    async function loadScalePair(firstName, lastName, request) {
+      const pair = await Promise.all([
+        loadFrame(firstName),
+        loadFrame(lastName),
+      ]);
+      if (request !== scaleRequest) {
+        return "stale";
+      }
+      anchor = pair[0];
+      anchorName = firstName;
+      scales = scalesFrom(pair[1], pair[0]);
+      scaleKey = lastName;
+      return "applied";
+    }
+
+    async function ensureScales(names) {
+      const lastName = names[names.length - 1];
+      if (lastName === scaleKey) {
+        return "same";
+      }
+      if (scaleFlight && scaleFlight.name === lastName) {
+        return scaleFlight.promise;
+      }
+      const request = ++scaleRequest;
+      const firstName = names[0];
+      const promise = loadScalePair(firstName, lastName, request);
+      scaleFlight = { name: lastName, promise: promise };
+      try {
+        return await promise;
+      } finally {
+        if (scaleFlight && scaleFlight.promise === promise) {
+          scaleFlight = null;
+        }
+      }
+    }
+
+    async function showFrame(name, repaint) {
+      if (name === shownFrame && !repaint) {
+        return;
+      }
+      if (name === shownFrame && shownData) {
+        paint(shownData);
+        return;
+      }
+      const data = await loadFrame(name);
+      shownFrame = name;
+      shownData = data;
+      scrubLabel.textContent = scrubCaption(name, data);
+      paint(data);
+    }
+
+    async function showLatestCheckpoint() {
+      const response = await fetch("/api/weights", { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error("ответ " + response.status);
+      }
+      shownFrame = null;
+      shownData = null;
+      paint(await response.json());
+    }
+
     async function poll() {
       try {
-        const response = await fetch("/api/weights", { cache: "no-store" });
-        if (!response.ok) {
-          throw new Error("ответ " + response.status);
+        const listResponse = await fetch("/api/history", { cache: "no-store" });
+        if (!listResponse.ok) {
+          throw new Error("ответ " + listResponse.status);
         }
-        paint(await response.json());
+        const names = await listResponse.json();
+        if (names.length === 0) {
+          clearScales();
+          scrubberNode.hidden = true;
+          await showLatestCheckpoint();
+          return;
+        }
+        const scaleResult = await ensureScales(names);
+        if (scaleResult === "stale") {
+          return;
+        }
+        const wasFollowing = followLatest;
+        frameNames = names;
+        scrubberNode.hidden = false;
+        scrubNode.max = String(names.length - 1);
+        if (wasFollowing) {
+          scrubNode.value = String(names.length - 1);
+        } else if (Number(scrubNode.value) > names.length - 1) {
+          scrubNode.value = String(names.length - 1);
+        }
+        const name = names[Number(scrubNode.value)];
+        await showFrame(name, scaleResult === "applied" && name === shownFrame);
       } catch (error) {
         statusNode.textContent = "Не удалось прочитать веса: " + error.message;
       }
     }
+
+    scrubNode.addEventListener("input", function () {
+      followLatest = Number(scrubNode.value) >= frameNames.length - 1;
+      const name = frameNames[Number(scrubNode.value)];
+      if (!name) {
+        return;
+      }
+      showFrame(name).catch(function (error) {
+        statusNode.textContent = "Не удалось прочитать веса: " + error.message;
+      });
+    });
 
     poll();
     setInterval(poll, POLL_MS);

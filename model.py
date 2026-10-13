@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "output"
 CHECKPOINT_PATH = OUTPUT_DIR / "checkpoint.pt"
+# Отдельный кадр на каждый сохранённый шаг. Каталог внутри output/, в git не входит.
+HISTORY_DIR = OUTPUT_DIR / "history"
 
 # Один и тот же seed в обучении и на странице весов.
 # До первого снимка страница показывает ровно те веса, с которых train.py начнёт.
@@ -27,8 +29,9 @@ SEED = 0
 EPOCHS = 10
 BATCH_SIZE = 64
 LEARNING_RATE = 0.1
-# Как часто train.py перезаписывает снимок, чтобы страница успевала за обучением.
-CHECKPOINT_EVERY_BATCHES = 50
+# Каждые столько вызовов optimizer.step() пишется отдельный кадр истории.
+# Конец эпохи пишется ещё раз, даже если номер шага на 10 не делится.
+HISTORY_EVERY_STEPS = 10
 
 
 class DigitNet(nn.Module):
